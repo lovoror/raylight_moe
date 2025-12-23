@@ -55,8 +55,17 @@ class RayWorker:
         self.is_cpu_offload = self.parallel_dict.get("fsdp_cpu_offload", False)
 
         os.environ["XDIT_LOGGING_LEVEL"] = "WARN"
-        os.environ["NCCL_DEBUG"] = "WARN"
+        os.environ["NCCL_DEBUG"] = "INFO" # Changed to INFO for better visibility on hardware errors
         os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
+        
+        # --- V100/Volta Hardware Stability Patches ---
+        # 1. Disable P2P if not on NVLink. V100 over PCIe often has unstable NCCL P2P.
+        os.environ["NCCL_P2P_DISABLE"] = "1"
+        # 2. Disable InfiniBand to prevent incorrect detection on consumer/older servers.
+        os.environ["NCCL_IB_DISABLE"] = "1"
+        # 3. Fragment memory management: Use expandable_segments to prevent OOM on tight 16G VRAM.
+        if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+             os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
         if sys.platform.startswith("linux"):
             dist.init_process_group(

@@ -91,13 +91,25 @@ def stochastic_rounding(value, dtype, seed=0, device_mesh=None):
     if dtype == torch.bfloat16:
         return value.to(dtype=torch.bfloat16)
     if dtype == torch.float8_e4m3fn or dtype == torch.float8_e5m2:
-        generator = torch.Generator(device=value.device)
-        generator.manual_seed(seed)
-        output = torch.empty_like(value, dtype=dtype)
-        num_slices = max(1, (value.numel() / (4096 * 4096)))
-        slice_size = max(1, round(value.shape[0] / num_slices))
-        for i in range(0, value.shape[0], slice_size):
-            output[i:i+slice_size].copy_(manual_stochastic_round_to_float8(value[i:i+slice_size], dtype, generator=generator, device_mesh=device_mesh))
-        return output
+        # --- 针对 V100 的关键补丁 ---
+        # 检测显卡算力，如果小于 8.0 (Ampere)，说明硬件不支持 FP8
+        # V100 是 7.0
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8:
+            # 强制升格为 FP16
+            # 原因：V100 的 NCCL 不支持 FP8 通信，强行用 FP8 会导致分布式崩溃
+            return value.to(dtype=torch.float16)
+        
+        # 如果是 4090/H800，保持您现在的优化（直接转换，省内存）
+        # 不要用原版那个复杂的 manual_stochastic_round，那个太吃内存了
+        return value.to(dtype=dtype)
+        # -----original -----------------
+        # generator = torch.Generator(device=value.device)
+        # generator.manual_seed(seed)
+        # output = torch.empty_like(value, dtype=dtype)
+        # num_slices = max(1, (value.numel() / (4096 * 4096)))
+        # slice_size = max(1, round(value.shape[0] / num_slices))
+        # for i in range(0, value.shape[0], slice_size):
+        #     output[i:i+slice_size].copy_(manual_stochastic_round_to_float8(value[i:i+slice_size], dtype, generator=generator, device_mesh=device_mesh))
+        # return output
 
     return value.to(dtype=dtype)
