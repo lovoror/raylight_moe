@@ -171,7 +171,7 @@ class RayWorker:
             from raylight.comfy_dist.model_management import cleanup_models_gc
             from raylight.comfy_dist.model_patcher import LowVramPatch
 
-            from raylight.comfy_dist.sd import fsdp_load_diffusion_model
+            from raylight.comfy_dist.sd import fsdp_load_diffusion_model, fsdp_load_diffusion_model_stat_dict
             from torch.distributed.fsdp import FSDPModule
 
             # Monkey patch
@@ -182,8 +182,14 @@ class RayWorker:
             if m is not None and isinstance(getattr(m, "diffusion_model", None), FSDPModule):
                 del self.model
                 self.model = None
-            self.model, self.state_dict = fsdp_load_diffusion_model(
-                unet_path,
+
+            sd = comfy.utils.load_torch_file(unet_path)
+            if self.parallel_dict.get("expert_parallel", False):
+                from raylight.distributed_modules.moe import filter_moe_experts
+                sd = filter_moe_experts(sd, self.local_rank, self.global_world_size)
+
+            self.model, self.state_dict = fsdp_load_diffusion_model_stat_dict(
+                sd,
                 self.local_rank,
                 self.device_mesh,
                 self.is_cpu_offload,

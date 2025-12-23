@@ -27,7 +27,14 @@ class USPInjectRegistry:
         for registered_cls, inject_func in cls._REGISTRY.items():
             if isinstance(base_model, registered_cls):
                 print(f"[USP] Initializing USP for {registered_cls.__name__}")
-                return inject_func(model_patcher, base_model, device_to, lowvram_model_memory, force_patch_weights, full_load)
+                res = inject_func(model_patcher, base_model, device_to, lowvram_model_memory, force_patch_weights, full_load)
+                
+                # Auto-patch MoE layers if Expert Parallelism is enabled
+                from .moe import patch_moe_layers
+                expert_parallel = model_patcher.parallel_dict.get("expert_parallel", False)
+                patch_moe_layers(base_model.diffusion_model, expert_parallel=expert_parallel)
+                
+                return res
         raise ValueError(f"Model: {type(base_model).__name__} is not yet supported for USP Parallelism")
 
 

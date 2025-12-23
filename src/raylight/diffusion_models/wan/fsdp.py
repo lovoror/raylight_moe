@@ -3,7 +3,7 @@ from raylight.distributed_modules.utils import detect_dtype_mismatch, ensure_no_
 from torch.distributed.checkpoint.state_dict import set_model_state_dict, StateDictOptions
 
 
-def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
+def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload, expert_parallel=False):
     diffusion_model = model.diffusion_model
     # Shard only the blocks, since other modules have different dtype
     # Collect params we want to ignore (everything except blocks)
@@ -16,6 +16,13 @@ def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
     for i, block in enumerate(diffusion_model.blocks):
         # This is for scaled model
         ignored_block_params = detect_dtype_mismatch(block, ref_dtype)
+        
+        # If expert parallel is enabled, we shard everything BUT the experts in the block
+        if expert_parallel:
+            for name, param in block.named_parameters():
+                if "mlp.experts." in name:
+                    ignored_block_params.add(param)
+
         diffusion_model.blocks[i] = fully_shard(
             module=block,
             mp_policy=MixedPrecisionPolicy(),

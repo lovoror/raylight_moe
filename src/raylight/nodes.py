@@ -159,6 +159,7 @@ class RayInitializer:
         FSDP,
         FSDP_CPU_OFFLOAD,
         XFuser_attention,
+        expert_parallel=False,
     ):
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be use in cluster of nodes. but it is long waaaaay down in the priority list
@@ -212,6 +213,8 @@ class RayInitializer:
         if FSDP:
             self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD
             self.parallel_dict["is_fsdp"] = True
+
+        self.parallel_dict["expert_parallel"] = expert_parallel
 
 
 
@@ -332,6 +335,47 @@ class RayUNETLoader:
         ray.get(patched_futures)
 
         return (ray_actors,)
+
+
+class RayMoEInitializer(RayInitializer):
+    @classmethod
+    def INPUT_TYPES(s):
+        types = RayInitializer.INPUT_TYPES()
+        types["required"]["expert_parallel"] = ("BOOLEAN", {"default": True})
+        return types
+
+    RETURN_TYPES = ("RAY_ACTORS_INIT",)
+    RETURN_NAMES = ("ray_actors_init",)
+    FUNCTION = "spawn_moe_actor"
+    CATEGORY = "Raylight"
+
+    def spawn_moe_actor(
+        self,
+        ray_cluster_address,
+        ray_cluster_namespace,
+        GPU,
+        ulysses_degree,
+        ring_degree,
+        cfg_degree,
+        sync_ulysses,
+        FSDP,
+        FSDP_CPU_OFFLOAD,
+        XFuser_attention,
+        expert_parallel,
+    ):
+        return super().spawn_actor(
+            ray_cluster_address,
+            ray_cluster_namespace,
+            GPU,
+            ulysses_degree,
+            ring_degree,
+            cfg_degree,
+            sync_ulysses,
+            FSDP,
+            FSDP_CPU_OFFLOAD,
+            XFuser_attention,
+            expert_parallel=expert_parallel
+        )
 
 
 class RayLoraLoader:
@@ -712,15 +756,17 @@ NODE_CLASS_MAPPINGS = {
     "RayLoraLoader": RayLoraLoader,
     "RayInitializer": RayInitializer,
     "DPNoiseList": DPNoiseList,
-    "RayVAEDecodeDistributed": RayVAEDecodeDistributed
+    "RayVAEDecodeDistributed": RayVAEDecodeDistributed,
+    "RayMoEInitializer": RayMoEInitializer,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "XFuserKSamplerAdvanced": "XFuser KSampler (Advanced)",
-    "DPKSamplerAdvanced": "Data Parallel KSampler (Advanced)",
+    "XFuserKSamplerAdvanced": "XFuser KSampler Advanced (Ray)",
+    "DPKSamplerAdvanced": "DP KSampler Advanced (Ray)",
     "RayUNETLoader": "Load Diffusion Model (Ray)",
     "RayLoraLoader": "Load Lora Model (Ray)",
     "RayInitializer": "Ray Init Actor",
     "DPNoiseList": "Data Parallel Noise List",
-    "RayVAEDecodeDistributed": "Distributed VAE (Ray)"
+    "RayVAEDecodeDistributed": "Ray VAE Decode (Distributed)",
+    "RayMoEInitializer": "Ray MoE Init Actor",
 }
