@@ -88,12 +88,13 @@ def safe_all_to_all_single(output, input, output_split_sizes=None, input_split_s
         r.wait()
 
 @torch.compiler.disable
-def expert_parallel_forward(module, x, gate_logits):
+def expert_parallel_forward(module, x, gate_logits, top_k=2):
     """
     Expert Parallel Forward pass.
     module: The MoE module being patched (contains self.experts)
     x: [Batch, Sequence, Hidden]
     gate_logits: [Batch, Sequence, NumExperts]
+    top_k: Number of experts to route each token to.
     """
     orig_shape = x.shape
     x = x.view(-1, orig_shape[-1])
@@ -104,13 +105,21 @@ def expert_parallel_forward(module, x, gate_logits):
     num_experts = gate_logits.shape[-1]
     experts_per_rank = num_experts // world_size
 
-    # 1. Routing (Top-1 for simplicity, can be extended to Top-K)
+    # 1. Routing
     probs = torch.softmax(gate_logits, dim=-1)
-    top1_probs, top1_indices = torch.topk(probs, 1, dim=-1)
+    topk_probs, topk_indices = torch.topk(probs, top_k, dim=-1)
+    
+    # Normalize top-k probabilities
+    topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True)
 
     # 2. Prepare tokens to send
-    # We need to sort tokens by their target rank
-    target_ranks = top1_indices.flatten() // experts_per_rank
+    # Each token is repeated top_k times for routing
+    flat_topk_indices = topk_indices.flatten()
+    # expert_parallel uses round-robin mapping (idx % world_size)
+    target_ranks = flat_topk_indices % world_size
+    
+    # repeat x for communication
+    expanded_x = x.unsqueeze(1).expand(-1, top_k, -1).reshape(-1, x.shape[-1])
     
     # Count how many tokens go to each rank
     send_counts = torch.zeros(world_size, dtype=torch.long, device=x.device)
@@ -118,34 +127,28 @@ def expert_parallel_forward(module, x, gate_logits):
         send_counts[r] = (target_ranks == r).sum()
 
     # Communication: tell other ranks how many tokens to expect
-    recv_counts = torch.empty_like(send_counts)
-    dist.all_gather_into_tensor(recv_counts.view(1, -1).expand(world_size, -1).contiguous(), send_counts)
-    # Actually, all_gather on a single tensor is easier:
     all_send_counts = [torch.zeros_like(send_counts) for _ in range(world_size)]
     dist.all_gather(all_send_counts, send_counts)
     recv_counts = torch.stack([all_send_counts[i][rank] for i in range(world_size)])
 
     # Sort tokens for all_to_all
     sort_indices = torch.argsort(target_ranks)
-    sorted_x = x[sort_indices]
+    sorted_expanded_x = expanded_x[sort_indices]
 
     # 3. All-to-All Transfer
     recv_tokens = torch.empty(recv_counts.sum(), x.shape[-1], device=x.device, dtype=x.dtype)
-    safe_all_to_all_single(recv_tokens, sorted_x, output_split_sizes=recv_counts.tolist(), input_split_sizes=send_counts.tolist())
+    safe_all_to_all_single(recv_tokens, sorted_expanded_x, output_split_sizes=recv_counts.tolist(), input_split_sizes=send_counts.tolist())
 
     # 4. Local Expert Computation
-    # We need to tell the receiving side which expert each token is for
     # Communication: send the expert indices too
     recv_expert_indices = torch.empty(recv_counts.sum(), dtype=torch.long, device=x.device)
-    # We need to sort indices just like we sorted x
-    sorted_expert_indices = top1_indices.flatten()[sort_indices]
+    sorted_expert_indices = flat_topk_indices[sort_indices]
     safe_all_to_all_single(recv_expert_indices, sorted_expert_indices, output_split_sizes=recv_counts.tolist(), input_split_sizes=send_counts.tolist())
 
     # Compute on local experts
     combined_output = torch.zeros_like(recv_tokens)
     
     for i, expert in enumerate(module.experts):
-        # We only execute the experts assigned to this rank during loading
         if i % world_size == rank:
             mask = (recv_expert_indices == i)
             if mask.any():
@@ -154,17 +157,22 @@ def expert_parallel_forward(module, x, gate_logits):
                 combined_output[mask] = expert_output
 
     # 5. All-to-All Back
-    final_sorted_output = torch.empty_like(sorted_x)
+    final_sorted_output = torch.empty_like(sorted_expanded_x)
     safe_all_to_all_single(final_sorted_output, combined_output, output_split_sizes=send_counts.tolist(), input_split_sizes=recv_counts.tolist())
 
-    # 6. Reorder back to original sequence
-    output = torch.empty_like(x)
-    output[sort_indices] = final_sorted_output
+    # 6. Reorder and combine
+    # reordered_output: [Tokens * top_k, Hidden]
+    reordered_output = torch.empty_like(expanded_x)
+    reordered_output[sort_indices] = final_sorted_output
     
-    # Apply gating probability
-    output = output * top1_probs.view(-1, 1)
+    # Reshape to [Tokens, top_k, Hidden] and multiply by weights
+    reordered_output = reordered_output.view(-1, top_k, x.shape[-1])
+    weighted_output = reordered_output * topk_probs.unsqueeze(-1)
+    
+    # Sum over top_k experts
+    final_output = weighted_output.sum(dim=1)
 
-    return output.view(orig_shape)
+    return final_output.view(orig_shape)
 
 def patch_moe_layers(model, expert_parallel=False):
     """
@@ -188,28 +196,16 @@ def patch_moe_layers(model, expert_parallel=False):
                 # We need to capture the current module in a closure
                 def make_patched_forward(m):
                     def new_forward(self, x, *args, **kwargs):
-                        # Most MoE blocks in DiT/Transformer expect (x, ...)
-                        # We need to intercept the gate computation or the expert execution.
-                        # Since we want to shuffle tokens, we must intercept BEFORE expert execution.
+                        # Detect top_k from module gate if possible, otherwise use default
+                        # Wan models typically use 2
+                        top_k = getattr(m, "top_k", 2)
                         
-                        # In many implementations, the forward looks like:
-                        # gate_logits = self.gate(x)
-                        # ...
-                        # return self.expert_parallel_forward(x, gate_logits)
-                        
-                        # If we patch the WHOLE forward, we might miss some context.
-                        # A better way is to patch the internal expert execution if possible,
-                        # but that's very implementation dependent.
-                        
-                        # Generic approach:
-                        # 1. Compute gate_logits
                         if hasattr(m, "gate"):
                             gate_logits = m.gate(x)
                         else:
                             gate_logits = m.router(x)
                         
-                        # 2. Call our distributed forward
-                        return expert_parallel_forward(m, x, gate_logits)
+                        return expert_parallel_forward(m, x, gate_logits, top_k=top_k)
                     
                     return new_forward
 

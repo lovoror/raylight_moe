@@ -92,11 +92,19 @@ def _build_remote_runtime_env(module_dir: Path, repo_root: Path):
 
     return {
         'py_modules': [str(module_dir)],
-        'working_dir': str(repo_root),
+        'working_dir': str(module_dir.parent),
         'env_vars': {
             'COMFYUI_BASE_DIRECTORY': '.',
         },
-        'excludes': excludes,
+        'excludes': excludes + [
+            '**/models/**', 
+            '**/input/**', 
+            '**/output/**', 
+            '**/temp/**',
+            '**/venv/**',
+            '**/.git/**',
+            '**/__pycache__/**'
+        ],
     }
 
 
@@ -222,13 +230,21 @@ class RayInitializer:
         if ray_cluster_address not in _LOCAL_CLUSTER_ADDRESSES:
             runtime_env_base = _RAY_RUNTIME_ENV_REMOTE
 
+        # Create a dynamic runtime env to include current MASTER_PORT/ADDR from os.environ
+        dynamic_runtime_env = deepcopy(runtime_env_base)
+        if "env_vars" not in dynamic_runtime_env:
+            dynamic_runtime_env["env_vars"] = {}
+        
+        dynamic_runtime_env["env_vars"]["MASTER_ADDR"] = os.environ.get("MASTER_ADDR", "127.0.0.1")
+        dynamic_runtime_env["env_vars"]["MASTER_PORT"] = os.environ.get("MASTER_PORT", "29500")
+
         try:
             # Shut down so if comfy user try another workflow it will not cause error
             ray.shutdown()
             ray.init(
                 ray_cluster_address,
                 namespace=ray_cluster_namespace,
-                runtime_env=deepcopy(runtime_env_base),
+                runtime_env=dynamic_runtime_env,
             )
         except Exception as e:
             ray.shutdown()
@@ -237,7 +253,7 @@ class RayInitializer:
             )
             raise RuntimeError(f"Ray connection failed: {e}")
 
-        ray_nccl_tester(world_size)
+        # Removed redundant ray_nccl_tester(world_size) to speed up startup by ~10-15s
         ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
         ray_actors = ray_actor_fn()
         return ([ray_actors, ray_actor_fn],)
@@ -264,6 +280,7 @@ class RayUNETLoader:
                     "RAY_ACTORS_INIT",
                     {"tooltip": "Ray Actor to submit the model into"},
                 ),
+                "activation_checkpointing": ("BOOLEAN", {"default": False}),
             },
             "optional": {"lora": ("RAY_LORA", {"default": None})},
         }
@@ -274,10 +291,11 @@ class RayUNETLoader:
 
     CATEGORY = "Raylight"
 
-    def load_ray_unet(self, ray_actors_init, unet_name, weight_dtype, lora=None):
+    def load_ray_unet(self, ray_actors_init, unet_name, weight_dtype, activation_checkpointing=False, lora=None):
         ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
 
         model_options = {}
+        model_options["activation_checkpointing"] = activation_checkpointing
         if weight_dtype == "fp8_e4m3fn":
             model_options["dtype"] = torch.float8_e4m3fn
         elif weight_dtype == "fp8_e4m3fn_fast":
@@ -301,7 +319,8 @@ class RayUNETLoader:
         loaded_futures = []
 
         if parallel_dict["is_fsdp"] is True:
-            worker0 = ray.get_actor("RayWorker:0")
+            worker0 = gpu_actors[0]
+            # worker0 = ray.get_actor("RayWorker:0")
             ray.get(worker0.load_unet.remote(unet_path, model_options=model_options))
             meta_model = ray.get(worker0.get_meta_model.remote())
 
@@ -318,9 +337,16 @@ class RayUNETLoader:
             ray.get(loaded_futures)
             loaded_futures = []
         else:
+            # OPTIMIZED BROADCAST LOAD: One worker reads, all workers share memory
+            # This is significantly faster on network shares and multi-GPU setups
+            worker0 = gpu_actors[0]
+            print(f">>> [Raylight] Loading model from disk on Worker 0: {unet_name}")
+            sd_ref = ray.get(worker0.get_unet_state_dict.remote(unet_path))
+            
+            print(f">>> [Raylight] Broadcasting model to {len(gpu_actors)} workers...")
             for actor in gpu_actors:
                 loaded_futures.append(
-                    actor.load_unet.remote(unet_path, model_options=model_options)
+                    actor.load_unet_from_state_dict.remote(sd_ref, model_options=model_options)
                 )
             ray.get(loaded_futures)
             loaded_futures = []
@@ -331,6 +357,10 @@ class RayUNETLoader:
                     patched_futures.append(actor.patch_usp.remote())
                 if parallel_dict["cfg_degree"] > 1:
                     patched_futures.append(actor.patch_cfg.remote())
+            
+            # MOE Patching should be independent of XDiT/USP if expert_parallel is True
+            if parallel_dict.get("expert_parallel", False):
+                patched_futures.append(actor.patch_moe.remote())
 
         ray.get(patched_futures)
 

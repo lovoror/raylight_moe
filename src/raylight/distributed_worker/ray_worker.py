@@ -66,13 +66,19 @@ class RayWorker:
         # 3. Fragment memory management: Use expandable_segments to prevent OOM on tight 16G VRAM.
         if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
              os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        
+        # --- Faster Failure/Timeout Settings ---
+        os.environ["NCCL_BLOCKING_WAIT"] = "1"
+        os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
+        # Set NCCL timeout to 10s (specified in milliseconds)
+        os.environ["NCCL_TIMEOUT"] = "10000"
 
         if sys.platform.startswith("linux"):
             dist.init_process_group(
                 "nccl",
                 rank=local_rank,
                 world_size=self.global_world_size,
-                timeout=timedelta(minutes=1),
+                timeout=timedelta(seconds=10),
                 # device_id=self.device
             )
         elif sys.platform.startswith("win"):
@@ -81,7 +87,7 @@ class RayWorker:
                 "gloo",
                 rank=local_rank,
                 world_size=self.global_world_size,
-                timeout=timedelta(minutes=1),
+                timeout=timedelta(seconds=10),
                 # device_id=self.device
             )
 
@@ -170,6 +176,38 @@ class RayWorker:
             USPInjectRegistry.inject,
         )
 
+    def patch_moe(self):
+        from raylight.distributed_modules.moe import patch_moe_layers
+        expert_parallel = self.parallel_dict.get("expert_parallel", False)
+        # Directly patch if not using USP registry which also calls it
+        patch_moe_layers(self.model.model.diffusion_model, expert_parallel=expert_parallel)
+
+    def get_unet_state_dict(self, unet_path):
+        """Worker 0 calls this to load SD from disk and put into Ray Object Store"""
+        sd = comfy.utils.load_torch_file(unet_path)
+        return ray.put(sd)
+
+    def load_unet_from_state_dict(self, sd, model_options):
+        """Other workers call this to load from shared memory sd"""
+        if self.parallel_dict["is_fsdp"] is True:
+            from raylight.comfy_dist.sd import fsdp_load_diffusion_model_stat_dict
+            self.model, self.state_dict = fsdp_load_diffusion_model_stat_dict(
+                sd,
+                self.local_rank,
+                self.device_mesh,
+                self.is_cpu_offload,
+                model_options=model_options,
+                parallel_dict=self.parallel_dict,
+            )
+        else:
+            self.model = comfy.sd.load_diffusion_model_state_dict(
+                sd, model_options=model_options,
+            )
+        
+        if self.lora_list is not None:
+             self.load_lora()
+        self.is_model_loaded = True
+
     def load_unet(self, unet_path, model_options):
         if self.parallel_dict["is_fsdp"] is True:
             # Monkey patch
@@ -203,6 +241,7 @@ class RayWorker:
                 self.device_mesh,
                 self.is_cpu_offload,
                 model_options=model_options,
+                parallel_dict=self.parallel_dict,
             )
         else:
             self.model = comfy.sd.load_diffusion_model(
@@ -252,6 +291,7 @@ class RayWorker:
                 self.local_rank,
                 self.device_mesh,
                 self.is_cpu_offload,
+                parallel_dict=self.parallel_dict,
             )
         else:
             from raylight.comfy_dist.sd import bnb_load_diffusion_model
@@ -285,6 +325,16 @@ class RayWorker:
                     self.model, None, lora_model, strength_model, 0
                 )[0]
             del lora_model
+
+    def comm_test(self):
+        """Simple all-reduce test to verify distributed environment"""
+        device = torch.device(f"cuda:{self.device_id}")
+        x = torch.ones(1, device=device) * (self.local_rank + 1)
+        dist.all_reduce(x, op=dist.ReduceOp.SUM)
+        expected = self.global_world_size * (self.global_world_size + 1) // 2
+        if abs(x.item() - expected) > 1e-3:
+            raise RuntimeError(f"COMM test failed on rank {self.local_rank}")
+        return True
 
     def kill(self):
         self.model = None
@@ -496,7 +546,7 @@ class RayCOMMTester:
                 "nccl",
                 rank=local_rank,
                 world_size=world_size,
-                timeout=timedelta(minutes=1),
+                timeout=timedelta(seconds=10),
                 # device_id=self.device
             )
         elif sys.platform.startswith("win"):
@@ -507,7 +557,7 @@ class RayCOMMTester:
                 "gloo",
                 rank=local_rank,
                 world_size=world_size,
-                timeout=timedelta(minutes=1),
+                timeout=timedelta(seconds=10),
                 # device_id=self.device
             )
         print("Running COMM pre-run")
@@ -575,8 +625,8 @@ def make_ray_actor_fn(
             )
         ray_actors["workers"] = gpu_actors
 
-        for actor in ray_actors["workers"]:
-            ray.get(actor.__ray_ready__.remote())
+        # Parallelize readiness check to allow all workers to import and init dist in parallel
+        ray.get([actor.__ray_ready__.remote() for actor in ray_actors["workers"]])
         return ray_actors
 
     return _init_ray_actor
@@ -609,3 +659,9 @@ def ensure_fresh_actors(ray_actors_init):
     parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
 
     return ray_actors, gpu_actors, parallel_dict
+
+
+def manual_nccl_test(gpu_actors):
+    """Optional manual test that doesn't kill actors"""
+    futures = [actor.comm_test.remote() for actor in gpu_actors]
+    return ray.get(futures)
