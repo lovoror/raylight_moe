@@ -56,6 +56,7 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
         fsdp_state_dict: dict | None = None,
         device_mesh=None,
         is_cpu_offload: bool = False,
+        parallel_dict: dict = {},
     ):
         super().__init__(
             model=model,
@@ -68,6 +69,7 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
         self.fsdp_state_dict = fsdp_state_dict
         self.device_mesh = device_mesh
         self.is_cpu_offload = is_cpu_offload
+        self.parallel_dict = parallel_dict
         self.patch_fsdp = patch_fsdp.__get__(self, FSDPModelPatcher)
 
     def config_fsdp(self, rank, device_mesh):
@@ -116,6 +118,7 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
         n.fsdp_state_dict = self.fsdp_state_dict
         n.device_mesh = self.device_mesh
         n.is_cpu_offload = self.is_cpu_offload
+        n.parallel_dict = self.parallel_dict
 
         return n
 
