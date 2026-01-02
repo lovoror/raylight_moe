@@ -93,8 +93,8 @@ def usp_dit_forward(
     del txt_ids, img_ids
 
     hidden_states = self.img_in(hidden_states)
-    encoder_hidden_states = self.txt_norm(encoder_hidden_states)
     encoder_hidden_states = self.txt_in(encoder_hidden_states)
+    encoder_hidden_states = self.txt_norm(encoder_hidden_states)
 
     temb = self.time_text_embed(timestep, hidden_states, additional_t_cond)
 
