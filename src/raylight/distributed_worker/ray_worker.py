@@ -225,10 +225,14 @@ class RayWorker:
             model_patcher.LowVramPatch = LowVramPatch
             model_management.cleanup_models_gc = cleanup_models_gc
 
-            m = getattr(self.model, "model", None)
-            if m is not None and isinstance(getattr(m, "diffusion_model", None), FSDPModule):
-                del self.model
-                self.model = None
+            # Correct cleanup, ensuring previous model is removed
+            del self.model
+            del self.state_dict
+            self.model = None
+            self.state_dict = None
+            torch.cuda.synchronize()
+            comfy.model_management.soft_empty_cache()
+            gc.collect()
 
             sd = comfy.utils.load_torch_file(unet_path)
             if self.parallel_dict.get("expert_parallel", False):
@@ -243,6 +247,9 @@ class RayWorker:
                 model_options=model_options,
                 parallel_dict=self.parallel_dict,
             )
+            torch.cuda.synchronize()
+            comfy.model_management.soft_empty_cache()
+            gc.collect()
         else:
             self.model = comfy.sd.load_diffusion_model(
                 unet_path, model_options=model_options,
@@ -428,6 +435,11 @@ class RayWorker:
 
         if self.parallel_dict["is_fsdp"] is True:
             self.model.patch_fsdp()
+            del self.state_dict
+            self.state_dict = None
+            torch.cuda.synchronize()
+            comfy.model_management.soft_empty_cache()
+            gc.collect()
 
         disable_pbar = comfy.utils.PROGRESS_BAR_ENABLED
         if self.local_rank == 0:

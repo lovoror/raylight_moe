@@ -27,8 +27,8 @@ def usp_dit_forward(
     timesteps,
     context,
     attention_mask=None,
-    guidance: torch.Tensor = None,
     ref_latents=None,
+    additional_t_cond=None,
     transformer_options={},
     control=None,
     **kwargs
@@ -40,14 +40,22 @@ def usp_dit_forward(
     hidden_states, img_ids, orig_shape = self.process_img(x)
     num_embeds = hidden_states.shape[1]
 
+    timestep_zero_index = None
     if ref_latents is not None:
         h = 0
         w = 0
         index = 0
-        index_ref_method = kwargs.get("ref_latents_method", "index") == "index"
+        ref_method = kwargs.get("ref_latents_method", self.default_ref_method)
+        index_ref_method = (ref_method == "index") or (ref_method == "index_timestep_zero")
+        negative_ref_method = ref_method == "negative_index"
+        timestep_zero = ref_method == "index_timestep_zero"
         for ref in ref_latents:
             if index_ref_method:
                 index += 1
+                h_offset = 0
+                w_offset = 0
+            elif negative_ref_method:
+                index -= 1
                 h_offset = 0
                 w_offset = 0
             else:
@@ -64,6 +72,10 @@ def usp_dit_forward(
             kontext, kontext_ids, _ = self.process_img(ref, index=index, h_offset=h_offset, w_offset=w_offset)
             hidden_states = torch.cat([hidden_states, kontext], dim=1)
             img_ids = torch.cat([img_ids, kontext_ids], dim=1)
+        if timestep_zero:
+            if index > 0:
+                timestep = torch.cat([timestep, timestep * 0], dim=0)
+                timestep_zero_index = num_embeds
 
     txt_start = round(max(
         ((x.shape[-1] + (self.patch_size // 2)) // self.patch_size) // 2,
@@ -74,7 +86,7 @@ def usp_dit_forward(
         .reshape(1, -1, 1)
         .repeat(x.shape[0], 1, 3))
 
-    # SP Modified, freq rope : tuple(txt, img)
+    # SP Modified, freq rope : List[txt, img]
     image_rotary_emb = [self.pe_embedder(img_ids).squeeze(1).unsqueeze(2).to(x.dtype).contiguous(),
                         self.pe_embedder(txt_ids).squeeze(1).unsqueeze(2).to(x.dtype).contiguous()]
 
@@ -84,14 +96,7 @@ def usp_dit_forward(
     encoder_hidden_states = self.txt_norm(encoder_hidden_states)
     encoder_hidden_states = self.txt_in(encoder_hidden_states)
 
-    if guidance is not None:
-        guidance = guidance * 1000
-
-    temb = (
-        self.time_text_embed(timestep, hidden_states)
-        if guidance is None
-        else self.time_text_embed(timestep, guidance, hidden_states)
-    )
+    temb = self.time_text_embed(timestep, hidden_states, additional_t_cond)
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     hidden_states, hidden_states_orig_size = pad_to_world_size(hidden_states, dim=1)
@@ -105,7 +110,7 @@ def usp_dit_forward(
     hidden_states = torch.chunk(hidden_states, sp_world_size, dim=1)[sp_rank]
     encoder_hidden_states = torch.chunk(encoder_hidden_states, sp_world_size, dim=1)[sp_rank]
 
-    # Modified, freq rope : tuple(txt, img)
+    # Modified, freq rope : List[txt, img]
     image_rotary_emb[0] = torch.chunk(image_rotary_emb[0], sp_world_size, dim=1)[sp_rank]
     image_rotary_emb[1] = torch.chunk(image_rotary_emb[1], sp_world_size, dim=1)[sp_rank]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
@@ -113,13 +118,28 @@ def usp_dit_forward(
     patches_replace = transformer_options.get("patches_replace", {})
     patches = transformer_options.get("patches", {})
     blocks_replace = patches_replace.get("dit", {})
+
+    transformer_options["total_blocks"] = len(self.transformer_blocks)
+    transformer_options["block_type"] = "double"
     for i, block in enumerate(self.transformer_blocks):
+        transformer_options["block_index"] = i
         if ("double_block", i) in blocks_replace:
             def block_wrap(args):
                 out = {}
-                out["txt"], out["img"] = block(hidden_states=args["img"], encoder_hidden_states=args["txt"], encoder_hidden_states_mask=encoder_hidden_states_mask, temb=args["vec"], image_rotary_emb=args["pe"])
+                out["txt"], out["img"] = block(hidden_states=args["img"],
+                                               encoder_hidden_states=args["txt"],
+                                               encoder_hidden_states_mask=encoder_hidden_states_mask,
+                                               temb=args["vec"],
+                                               image_rotary_emb=args["pe"],
+                                               timestep_zero_index=timestep_zero_index,
+                                               transformer_options=args["transformer_options"])
                 return out
-            out = blocks_replace[("double_block", i)]({"img": hidden_states, "txt": encoder_hidden_states, "vec": temb, "pe": image_rotary_emb}, {"original_block": block_wrap})
+            out = blocks_replace[("double_block", i)]({"img": hidden_states,
+                                                       "txt": encoder_hidden_states,
+                                                       "vec": temb,
+                                                       "pe": image_rotary_emb,
+                                                       "transformer_options": transformer_options},
+                                                      {"original_block": block_wrap})
             hidden_states = out["img"]
             encoder_hidden_states = out["txt"]
         else:
@@ -129,11 +149,17 @@ def usp_dit_forward(
                 encoder_hidden_states_mask=encoder_hidden_states_mask,
                 temb=temb,
                 image_rotary_emb=image_rotary_emb,
+                timestep_zero_index=timestep_zero_index,
+                transformer_options=transformer_options,
             )
 
         if "double_block" in patches:
             for p in patches["double_block"]:
-                out = p({"img": hidden_states, "txt": encoder_hidden_states, "x": x, "block_index": i})
+                out = p({"img": hidden_states,
+                         "txt": encoder_hidden_states,
+                         "x": x,
+                         "block_index": i,
+                         "transformer_options": transformer_options})
                 hidden_states = out["img"]
                 encoder_hidden_states = out["txt"]
 
@@ -143,6 +169,9 @@ def usp_dit_forward(
                 add = control_i[i]
                 if add is not None:
                     hidden_states[:, :add.shape[1]] += add
+
+    if timestep_zero_index is not None:
+        temb = temb.chunk(2, dim=0)[0]
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     hidden_states = get_sp_group().all_gather(hidden_states.contiguous(), dim=1)
