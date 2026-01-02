@@ -109,7 +109,16 @@ def usp_dit_forward(
             if encoder_hidden_states.shape[-1] == self.txt_norm.weight.shape[0]:
                 encoder_hidden_states = self.txt_norm(encoder_hidden_states)
 
-    temb = self.time_text_embed(timestep, hidden_states, additional_t_cond)
+    # Robust time_text_embed call to handle signature differences between Qwen variants
+    if additional_t_cond is not None:
+        try:
+            # New upstream signature: (t, x, cond)
+            temb = self.time_text_embed(timestep, hidden_states, additional_t_cond)
+        except TypeError:
+            # Fallback for models only accepting (t, x) or having a different signature
+            temb = self.time_text_embed(timestep, hidden_states)
+    else:
+        temb = self.time_text_embed(timestep, hidden_states)
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     hidden_states, hidden_states_orig_size = pad_to_world_size(hidden_states, dim=1)
