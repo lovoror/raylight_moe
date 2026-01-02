@@ -148,14 +148,21 @@ def usp_dit_forward(
         if ("double_block", i) in blocks_replace:
             def block_wrap(args):
                 out = {}
-                out["txt"], out["img"] = block(hidden_states=args["img"],
-                                               encoder_hidden_states=args["txt"],
-                                               encoder_hidden_states_mask=encoder_hidden_states_mask,
-                                               temb=args["vec"],
-                                               image_rotary_emb=args["pe"],
-                                               timestep_zero_index=timestep_zero_index,
-                                               transformer_options=args["transformer_options"])
+                # Robust call for block_wrap
+                kwargs_local = {
+                    "hidden_states": args["img"],
+                    "encoder_hidden_states": args["txt"],
+                    "encoder_hidden_states_mask": encoder_hidden_states_mask,
+                    "temb": args["vec"],
+                    "image_rotary_emb": args["pe"],
+                    "transformer_options": args["transformer_options"],
+                }
+                try:
+                    out["txt"], out["img"] = block(**kwargs_local, timestep_zero_index=timestep_zero_index)
+                except TypeError:
+                    out["txt"], out["img"] = block(**kwargs_local)
                 return out
+            
             out = blocks_replace[("double_block", i)]({"img": hidden_states,
                                                        "txt": encoder_hidden_states,
                                                        "vec": temb,
@@ -165,15 +172,19 @@ def usp_dit_forward(
             hidden_states = out["img"]
             encoder_hidden_states = out["txt"]
         else:
-            encoder_hidden_states, hidden_states = block(
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_hidden_states_mask=encoder_hidden_states_mask,
-                temb=temb,
-                image_rotary_emb=image_rotary_emb,
-                timestep_zero_index=timestep_zero_index,
-                transformer_options=transformer_options,
-            )
+            # Robust call for the default block
+            kwargs_local = {
+                "hidden_states": hidden_states,
+                "encoder_hidden_states": encoder_hidden_states,
+                "encoder_hidden_states_mask": encoder_hidden_states_mask,
+                "temb": temb,
+                "image_rotary_emb": image_rotary_emb,
+                "transformer_options": transformer_options,
+            }
+            try:
+                encoder_hidden_states, hidden_states = block(**kwargs_local, timestep_zero_index=timestep_zero_index)
+            except TypeError:
+                encoder_hidden_states, hidden_states = block(**kwargs_local)
 
         if "double_block" in patches:
             for p in patches["double_block"]:
