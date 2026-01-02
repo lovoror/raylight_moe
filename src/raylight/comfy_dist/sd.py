@@ -34,7 +34,7 @@ def load_lora_for_models(model, lora, strength_model):
     return new_modelpatcher
 
 
-def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, model_options={}):
+def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, model_options={}, parallel_dict={}):
     dtype = model_options.get("dtype", None)
     diffusion_model_prefix = model_detection.unet_prefix_from_state_dict(sd)
     temp_sd = comfy.utils.state_dict_prefix_replace(
@@ -108,16 +108,18 @@ def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, m
         rank=rank,
         device_mesh=device_mesh,
         is_cpu_offload=is_cpu_offload,
+        parallel_dict=parallel_dict,
     )
+    model_patcher.model_options = model_options
     state_dict = model_patcher.model_state_dict()
     model_patcher.model.to("meta")
 
     return model_patcher, state_dict
 
 
-def fsdp_load_diffusion_model(unet_path, rank, device_mesh, is_cpu_offload, model_options={}):
+def fsdp_load_diffusion_model(unet_path, rank, device_mesh, is_cpu_offload, model_options={}, parallel_dict={}):
     sd = comfy.utils.load_torch_file(unet_path)
-    model, state_dict = fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, model_options=model_options)
+    model, state_dict = fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, model_options=model_options, parallel_dict=parallel_dict)
     if model is None:
         logging.error("ERROR UNSUPPORTED DIFFUSION MODEL {}".format(unet_path))
         raise RuntimeError("ERROR: Could not detect model type of: {}\n{}".format(unet_path, model_detection_error_hint(unet_path, sd)))
@@ -155,11 +157,11 @@ def gguf_load_diffusion_model(unet_path, model_options={}, dequant_dtype=None, p
     return model
 
 
-def fsdp_bnb_load_diffusion_model(unet_path, rank, device_mesh, is_cpu_offload, model_options={}):
+def fsdp_bnb_load_diffusion_model(unet_path, rank, device_mesh, is_cpu_offload, model_options={}, parallel_dict={}):
     from raylight.expansion.comfyui_bnb import OPS
 
     sd = comfy.utils.load_torch_file(unet_path)
-    model, state_dict = fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, model_options={"custom_operations": OPS})
+    model, state_dict = fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, model_options={"custom_operations": OPS}, parallel_dict=parallel_dict)
     if model is None:
         logging.error("ERROR UNSUPPORTED DIFFUSION MODEL {}".format(unet_path))
         raise RuntimeError("ERROR: Could not detect model type of: {}\n{}".format(unet_path, model_detection_error_hint(unet_path, sd)))
@@ -212,7 +214,7 @@ def decode_tiled_3d(self, samples, tile_t=999, tile_x=32, tile_y=32, overlap=(1,
 ##################################################
 # MODIFIYING HERE
 ##################################################
-def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, model_options={}, metadata=None):
+def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, model_options={}, metadata=None, parallel_dict={}):
     dtype = model_options.get("dtype", None)
     diffusion_model_prefix = model_detection.unet_prefix_from_state_dict(sd)
     temp_sd = comfy.utils.state_dict_prefix_replace(
@@ -322,6 +324,7 @@ def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, m
         rank=rank,
         device_mesh=device_mesh,
         is_cpu_offload=is_cpu_offload,
+        parallel_dict=parallel_dict,
     )
     state_dict = model_patcher.model_state_dict()
     model_patcher.model.to("meta")

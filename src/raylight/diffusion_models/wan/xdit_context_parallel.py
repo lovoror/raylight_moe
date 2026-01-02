@@ -81,6 +81,16 @@ def apply_rope_sp(xq, xk, freqs_cis):
     return xq_out.reshape_as(xq).type_as(xq), xk_out.reshape_as(xk).type_as(xk)
 
 
+def checkpoint_block(block, x, e, freqs, context, context_img_len, transformer_options=None):
+    if transformer_options is not None:
+        return block(x, e=e, freqs=freqs, context=context, context_img_len=context_img_len, transformer_options=transformer_options)
+    return block(x, e=e, freqs=freqs, context=context, context_img_len=context_img_len)
+
+def checkpoint_block(block, x, e, freqs, context, context_img_len, transformer_options=None):
+    if transformer_options is not None:
+        return block(x, e=e, freqs=freqs, context=context, context_img_len=context_img_len, transformer_options=transformer_options)
+    return block(x, e=e, freqs=freqs, context=context, context_img_len=context_img_len)
+
 @torch.compiler.disable
 def usp_dit_forward(
     self,
@@ -141,12 +151,13 @@ def usp_dit_forward(
     x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
 
+    checkpoint_enabled = transformer_options.get("activation_checkpointing", False)
+    
     patches_replace = transformer_options.get("patches_replace", {})
     blocks_replace = patches_replace.get("dit", {})
     for i, block in enumerate(self.blocks):
         if ("double_block", i) in blocks_replace:
-
-            def block_wrap(args):
+             def block_wrap(args):
                 out = {}
                 out["img"] = block(
                     args["img"],
@@ -157,15 +168,20 @@ def usp_dit_forward(
                 )
                 return out
 
-            out = blocks_replace[("double_block", i)](
+             # Currently, we don't checkpoint blocks with patches as it's complex
+             out = blocks_replace[("double_block", i)](
                 {"img": x, "txt": context, "vec": e0, "pe": freqs},
                 {"original_block": block_wrap},
-            )
-            x = out["img"]
+             )
+             x = out["img"]
         else:
-            x = block(
-                x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len
-            )
+            if checkpoint_enabled:
+                from torch.utils.checkpoint import checkpoint
+                x = checkpoint(checkpoint_block, block, x, e0, freqs, context, context_img_len, None, use_reentrant=False)
+            else:
+                x = block(
+                    x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len
+                )
 
     torch._dynamo.graph_break()
     # ======================== ADD SEQUENCE PARALLEL ========================= #
@@ -237,7 +253,11 @@ def usp_vace_dit_forward(
             out = blocks_replace[("double_block", i)]({"img": x, "txt": context, "vec": e0, "pe": freqs, "transformer_options": transformer_options}, {"original_block": block_wrap})
             x = out["img"]
         else:
-            x = block(x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, transformer_options=transformer_options)
+            if checkpoint_enabled:
+                from torch.utils.checkpoint import checkpoint
+                x = checkpoint(checkpoint_block, block, x, e0, freqs, context, context_img_len, transformer_options, use_reentrant=False)
+            else:
+                x = block(x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, transformer_options=transformer_options)
 
         ii = self.vace_layers_mapping.get(i, None)
         if ii is not None:
@@ -305,7 +325,11 @@ def usp_camera_dit_forward(
             out = blocks_replace[("double_block", i)]({"img": x, "txt": context, "vec": e0, "pe": freqs, "transformer_options": transformer_options}, {"original_block": block_wrap})
             x = out["img"]
         else:
-            x = block(x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, transformer_options=transformer_options)
+            if checkpoint_enabled:
+                from torch.utils.checkpoint import checkpoint
+                x = checkpoint(checkpoint_block, block, x, e0, freqs, context, context_img_len, transformer_options, use_reentrant=False)
+            else:
+                x = block(x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, transformer_options=transformer_options)
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     x = get_sp_group().all_gather(x, dim=1)
@@ -377,7 +401,13 @@ def usp_humo_dit_forward(
             out = blocks_replace[("double_block", i)]({"img": x, "txt": context, "vec": e0, "pe": freqs, "transformer_options": transformer_options}, {"original_block": block_wrap})
             x = out["img"]
         else:
-            x = block(x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, audio=audio, transformer_options=transformer_options)
+            if checkpoint_enabled:
+                from torch.utils.checkpoint import checkpoint
+                def checkpoint_block_humo(block, x, e, freqs, context, context_img_len, audio, transformer_options):
+                    return block(x, e=e, freqs=freqs, context=context, context_img_len=context_img_len, audio=audio, transformer_options=transformer_options)
+                x = checkpoint(checkpoint_block_humo, block, x, e0, freqs, context, context_img_len, audio, transformer_options, use_reentrant=False)
+            else:
+                x = block(x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, audio=audio, transformer_options=transformer_options)
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     x = get_sp_group().all_gather(x, dim=1)
@@ -471,7 +501,13 @@ def usp_s2v_dit_forward(
             out = blocks_replace[("double_block", i)]({"img": x, "txt": context, "vec": e0, "pe": freqs}, {"original_block": block_wrap})
             x = out["img"]
         else:
-            x = block(x, e=e0, freqs=freqs, context=context)
+            if checkpoint_enabled:
+                from torch.utils.checkpoint import checkpoint
+                def checkpoint_block_s2v(block, x, e, freqs, context):
+                    return block(x, e=e, freqs=freqs, context=context)
+                x = checkpoint(checkpoint_block_s2v, block, x, e0, freqs, context, use_reentrant=False)
+            else:
+                x = block(x, e=e0, freqs=freqs, context=context)
         if audio_emb is not None:
             x = self.audio_injector(x, i, audio_emb, audio_emb_global, seq_len)
 

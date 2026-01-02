@@ -1,0 +1,58 @@
+import torch
+import gc
+import ray
+import os
+import time
+
+class RayLatentPassAndKill:
+    def __init__(self):
+        pass
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "latent": ("LATENT",),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "kill_and_pass"
+    CATEGORY = "Raylight/Utils"
+
+    def kill_and_pass(self, latent):
+        print(">>> [RayKiller] 开始清理环境... <<<")
+        
+        # 1. 停止 Ray (释放 40GB+ 内存)
+        if ray.is_initialized():
+            try:
+                ray.shutdown()
+                print(">>> [RayKiller] Ray 已关闭 (Shutdown) <<<")
+            except Exception as e:
+                print(f"Error shutting down Ray: {e}")
+        
+        # 2. 显存大扫除
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        
+        # 3. 【关键修复】自动轮换端口，避开 TIME_WAIT
+        # 读取当前端口，默认为 29500
+        current_port = int(os.environ.get("MASTER_PORT", "29500"))
+        new_port = current_port + 1
+        # 设置新的环境变量，这会影响后续启动的所有 Ray Worker
+        os.environ["MASTER_PORT"] = str(new_port)
+        
+        print(f">>> [RayKiller] 端口已轮换: {current_port} -> {new_port} <<<")
+        print(">>> [RayKiller] 等待 2 秒让端口释放... <<<")
+        time.sleep(2)
+
+        return (latent,)
+
+NODE_CLASS_MAPPINGS = {
+    "RayLatentPassAndKill": RayLatentPassAndKill
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "RayLatentPassAndKill": "Ray Killer & Port Rotator"
+}

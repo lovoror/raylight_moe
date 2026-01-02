@@ -56,6 +56,12 @@ def usp_face_block_forward(
     return output
 
 
+def checkpoint_block(block, x, e, freqs, context, context_img_len, transformer_options=None):
+    if transformer_options is not None:
+        return block(x, e=e, freqs=freqs, context=context, context_img_len=context_img_len, transformer_options=transformer_options)
+    return block(x, e=e, freqs=freqs, context=context, context_img_len=context_img_len)
+
+
 def usp_animate_dit_forward(
     self,
     x,
@@ -102,6 +108,8 @@ def usp_animate_dit_forward(
     x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
 
+    checkpoint_enabled = transformer_options.get("activation_checkpointing", False)
+
     patches_replace = transformer_options.get("patches_replace", {})
     blocks_replace = patches_replace.get("dit", {})
     for i, block in enumerate(self.blocks):
@@ -110,13 +118,26 @@ def usp_animate_dit_forward(
                 out = {}
                 out["img"] = block(args["img"], context=args["txt"], e=args["vec"], freqs=args["pe"], context_img_len=context_img_len, transformer_options=args["transformer_options"])
                 return out
-            out = blocks_replace[("double_block", i)]({"img": x, "txt": context, "vec": e0, "pe": freqs, "transformer_options": transformer_options}, {"original_block": block_wrap})
+            
+            if checkpoint_enabled:
+                from torch.utils.checkpoint import checkpoint
+                out = blocks_replace[("double_block", i)]({"img": x, "txt": context, "vec": e0, "pe": freqs, "transformer_options": transformer_options}, {"original_block": block_wrap})
+            else:
+                out = blocks_replace[("double_block", i)]({"img": x, "txt": context, "vec": e0, "pe": freqs, "transformer_options": transformer_options}, {"original_block": block_wrap})
             x = out["img"]
         else:
-            x = block(x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, transformer_options=transformer_options)
+            if checkpoint_enabled:
+                from torch.utils.checkpoint import checkpoint
+                x = checkpoint(checkpoint_block, block, x, e0, freqs, context, context_img_len, transformer_options, use_reentrant=False)
+            else:
+                x = block(x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, transformer_options=transformer_options)
 
         if i % 5 == 0 and motion_vec is not None:
-            x = x + self.face_adapter.fuser_blocks[i // 5](x, motion_vec)
+            if checkpoint_enabled:
+                from torch.utils.checkpoint import checkpoint
+                x = x + checkpoint(self.face_adapter.fuser_blocks[i // 5], x, motion_vec, use_reentrant=False)
+            else:
+                x = x + self.face_adapter.fuser_blocks[i // 5](x, motion_vec)
 
     # head
     # ======================== ADD SEQUENCE PARALLEL ========================= #
