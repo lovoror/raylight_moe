@@ -93,8 +93,21 @@ def usp_dit_forward(
     del txt_ids, img_ids
 
     hidden_states = self.img_in(hidden_states)
-    encoder_hidden_states = self.txt_in(encoder_hidden_states)
-    encoder_hidden_states = self.txt_norm(encoder_hidden_states)
+    
+    # Text processing with dimension awareness
+    if hasattr(self, "txt_in") and self.txt_in is not None:
+        if encoder_hidden_states.shape[-1] == self.txt_in.in_features:
+            encoder_hidden_states = self.txt_in(encoder_hidden_states)
+    
+    if hasattr(self, "txt_norm") and self.txt_norm is not None:
+        # Check if it's a NormalizedLayer or has weight with matching shape
+        norm_shape = getattr(self.txt_norm, "normalized_shape", None)
+        if norm_shape is not None and isinstance(norm_shape, (tuple, list, torch.Size)):
+            if encoder_hidden_states.shape[-1] == norm_shape[0]:
+                encoder_hidden_states = self.txt_norm(encoder_hidden_states)
+        elif hasattr(self.txt_norm, "weight") and self.txt_norm.weight is not None:
+            if encoder_hidden_states.shape[-1] == self.txt_norm.weight.shape[0]:
+                encoder_hidden_states = self.txt_norm(encoder_hidden_states)
 
     temb = self.time_text_embed(timestep, hidden_states, additional_t_cond)
 
